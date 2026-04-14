@@ -1,7 +1,6 @@
 import json
 import asyncio
 from decimal import Decimal
-from functools import lru_cache
 from time import time
 from web3 import Web3
 from web3.exceptions import TransactionNotFound, TimeExhausted
@@ -16,6 +15,26 @@ app = FastAPI()
 CHAIN_ID = 56
 GAS_LIMIT_FALLBACK = 100000
 PRICE_CACHE_TTL = 30  # seconds
+
+# ------------------------------------------------------------
+#  PancakeSwap Router (fallback price source)
+# ------------------------------------------------------------
+PANCAKE_ROUTER = "0x10ED43C718714eb63d5aA57B78B54704E256024E"
+WBNB = "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c"
+USDT = "0x55d398326f99059fF775485246999027B3197955"
+
+ROUTER_ABI = [
+    {
+        "name": "getAmountsOut",
+        "type": "function",
+        "stateMutability": "view",
+        "inputs": [
+            {"name": "amountIn", "type": "uint256"},
+            {"name": "path", "type": "address[]"}
+        ],
+        "outputs": [{"name": "", "type": "uint256[]"}]
+    }
+]
 
 # ------------------------------------------------------------
 #  USDT ABI
@@ -48,28 +67,58 @@ USDT_ABI = [
 ]
 
 # ------------------------------------------------------------
-#  Price helper
+#  Price helper with fallback and cache
 # ------------------------------------------------------------
 _price_cache = {"price": None, "timestamp": 0}
 
-async def get_bnb_usdt_price() -> float | None:
-    """Fetch BNB/USDT price from Binance, with simple TTL cache."""
+def get_bnb_usdt_price_from_pancake(w3: Web3) -> float | None:
+    """Get BNB/USDT price using PancakeSwap router (on-chain)."""
+    try:
+        router = w3.eth.contract(
+            address=w3.to_checksum_address(PANCAKE_ROUTER),
+            abi=ROUTER_ABI
+        )
+        amount_in = w3.to_wei(1, "ether")  # 1 BNB
+        amounts = router.functions.getAmountsOut(
+            amount_in,
+            [w3.to_checksum_address(WBNB), w3.to_checksum_address(USDT)]
+        ).call()
+        # amounts[1] is USDT amount (in smallest unit, 18 decimals)
+        price = amounts[1] / 10 ** 18
+        return float(price)
+    except Exception as e:
+        print(f"PancakeSwap price fetch failed: {e}")
+        return None
+
+async def get_bnb_usdt_price(w3: Web3) -> float | None:
+    """Fetch BNB/USDT price: Binance API first, fallback to PancakeSwap."""
     global _price_cache
     now = time()
     if _price_cache["price"] is not None and (now - _price_cache["timestamp"]) < PRICE_CACHE_TTL:
         return _price_cache["price"]
 
+    price = None
+    # Try Binance API
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             resp = await client.get("https://api.binance.com/api/v3/ticker/price?symbol=BNBUSDT")
             if resp.status_code == 200:
                 data = resp.json()
                 price = float(data["price"])
-                _price_cache = {"price": price, "timestamp": now}
-                return price
-    except Exception:
-        pass
-    return None
+                print(f"Binance price: {price}")
+    except Exception as e:
+        print(f"Binance API failed: {e}")
+
+    # Fallback to PancakeSwap if Binance failed
+    if price is None:
+        price = get_bnb_usdt_price_from_pancake(w3)
+        if price is not None:
+            print(f"PancakeSwap price: {price}")
+
+    if price is not None:
+        _price_cache = {"price": price, "timestamp": now}
+
+    return price
 
 # ------------------------------------------------------------
 #  Utils
@@ -129,7 +178,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 # ------------------------------------------------------------
 #  Health Check
 # ------------------------------------------------------------
-@app.get("/")
+@app.get("/health")
 async def health_check():
     return JSONResponse(content={"status": "ok", "service": "usdt-sender"})
 
@@ -185,8 +234,8 @@ async def check_balance(request: Request):
     except Exception as e:
         return error_response("USDT_BALANCE_ERROR", f"Failed to fetch USDT balance: {str(e)}")
 
-    # Get BNB price in USDT
-    bnb_price = await get_bnb_usdt_price()
+    # Get BNB price in USDT (with fallback)
+    bnb_price = await get_bnb_usdt_price(w3)
     bnb_usdt_value = None
     if bnb_price is not None:
         bnb_usdt_value = format_decimal(bnb_balance * bnb_price, 2)
@@ -326,8 +375,8 @@ async def send_usdt(request: Request):
         gas_cost_bnb = w3.from_wei(gas_cost_wei, 'ether')
         gas_cost_bnb_str = format_decimal(gas_cost_bnb, 18)
 
-        # BNB price for USDT conversion
-        bnb_price = await get_bnb_usdt_price()
+        # Get BNB price with fallback
+        bnb_price = await get_bnb_usdt_price(w3)
         gas_cost_usdt = None
         if bnb_price is not None:
             gas_cost_usdt = format_decimal(gas_cost_bnb * bnb_price, 6)
@@ -357,7 +406,7 @@ async def send_usdt(request: Request):
                 "gas_price_wei": gas_price,
                 "gas_cost_wei": gas_cost_wei,
                 "gas_cost_bnb": gas_cost_bnb_str,
-                "gas_cost_usdt": gas_cost_usdt,  # optional, if price available
+                "gas_cost_usdt": gas_cost_usdt,
                 "gas_currency": "BNB"
             },
             "transaction_hash": w3.to_hex(tx_hash),
