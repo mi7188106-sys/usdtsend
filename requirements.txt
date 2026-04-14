@@ -1,3 +1,4 @@
 fastapi
 uvicorn
 web3
+httpx
