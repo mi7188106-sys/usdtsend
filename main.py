@@ -67,12 +67,12 @@ USDT_ABI = [
 ]
 
 # ------------------------------------------------------------
-#  Price helper with fallback and cache
+#  Price helper with fallback and cache (returns Decimal)
 # ------------------------------------------------------------
 _price_cache = {"price": None, "timestamp": 0}
 
-def get_bnb_usdt_price_from_pancake(w3: Web3) -> float | None:
-    """Get BNB/USDT price using PancakeSwap router (on-chain)."""
+def get_bnb_usdt_price_from_pancake(w3: Web3) -> Decimal | None:
+    """Get BNB/USDT price using PancakeSwap router (on-chain). Returns Decimal."""
     try:
         router = w3.eth.contract(
             address=w3.to_checksum_address(PANCAKE_ROUTER),
@@ -84,18 +84,20 @@ def get_bnb_usdt_price_from_pancake(w3: Web3) -> float | None:
             [w3.to_checksum_address(WBNB), w3.to_checksum_address(USDT)]
         ).call()
         # amounts[1] is USDT amount (in smallest unit, 18 decimals)
-        price = amounts[1] / 10 ** 18
-        return float(price)
+        price = Decimal(amounts[1]) / Decimal(10 ** 18)
+        return price
     except Exception as e:
         print(f"PancakeSwap price fetch failed: {e}")
         return None
 
-async def get_bnb_usdt_price(w3: Web3) -> float | None:
-    """Fetch BNB/USDT price: Binance API first, fallback to PancakeSwap."""
+async def get_bnb_usdt_price(w3: Web3) -> Decimal | None:
+    """Fetch BNB/USDT price: Binance API first, fallback to PancakeSwap. Returns Decimal."""
     global _price_cache
     now = time()
-    if _price_cache["price"] is not None and (now - _price_cache["timestamp"]) < PRICE_CACHE_TTL:
-        return _price_cache["price"]
+    cached = _price_cache["price"]
+    if cached is not None and (now - _price_cache["timestamp"]) < PRICE_CACHE_TTL:
+        # Ensure cached value is Decimal
+        return Decimal(str(cached)) if not isinstance(cached, Decimal) else cached
 
     price = None
     # Try Binance API
@@ -104,7 +106,7 @@ async def get_bnb_usdt_price(w3: Web3) -> float | None:
             resp = await client.get("https://api.binance.com/api/v3/ticker/price?symbol=BNBUSDT")
             if resp.status_code == 200:
                 data = resp.json()
-                price = float(data["price"])
+                price = Decimal(data["price"])
                 print(f"Binance price: {price}")
     except Exception as e:
         print(f"Binance API failed: {e}")
@@ -135,7 +137,7 @@ def format_decimal(value, precision=18):
 
 def to_serializable(obj):
     if isinstance(obj, Decimal):
-        return float(obj)
+        return float(obj)  # Convert Decimal to float for JSON
     if isinstance(obj, dict):
         return {k: to_serializable(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
@@ -213,14 +215,13 @@ async def check_balance(request: Request):
 
     try:
         account = w3.eth.account.from_key(private_key)
-        address = account.address
-        checksum_address = w3.to_checksum_address(address)
+        checksum_address = w3.to_checksum_address(account.address)
     except Exception as e:
         return error_response("INVALID_PRIVATE_KEY", str(e))
 
     # BNB balance
     bnb_wei = w3.eth.get_balance(checksum_address)
-    bnb_balance = w3.from_wei(bnb_wei, 'ether')
+    bnb_balance = w3.from_wei(bnb_wei, 'ether')  # Decimal
     bnb_balance_str = format_decimal(bnb_balance, 18)
 
     # USDT balance
@@ -229,26 +230,27 @@ async def check_balance(request: Request):
         usdt_contract = w3.eth.contract(address=usdt_checksum, abi=USDT_ABI)
         decimals = usdt_contract.functions.decimals().call()
         usdt_wei = usdt_contract.functions.balanceOf(checksum_address).call()
-        usdt_balance = usdt_wei / (10 ** decimals)
+        usdt_balance = Decimal(usdt_wei) / Decimal(10 ** decimals)
         usdt_balance_str = format_decimal(usdt_balance, decimals)
     except Exception as e:
         return error_response("USDT_BALANCE_ERROR", f"Failed to fetch USDT balance: {str(e)}")
 
-    # Get BNB price in USDT (with fallback)
+    # Get BNB price (Decimal)
     bnb_price = await get_bnb_usdt_price(w3)
     bnb_usdt_value = None
     if bnb_price is not None:
-        bnb_usdt_value = format_decimal(bnb_balance * bnb_price, 2)
-    # USDT value in USD (assuming 1:1)
+        # SAFETY: ensure both operands are Decimal
+        bnb_usdt_value = format_decimal(bnb_balance * Decimal(str(bnb_price)), 2)
+
     usdt_usd_value = format_decimal(usdt_balance, 2)
 
-    return JSONResponse(content={
+    return JSONResponse(content=to_serializable({
         "success": True,
         "address": checksum_address,
         "bnb": {
             "wei": str(bnb_wei),
             "formatted": bnb_balance_str,
-            "usd_value": bnb_usdt_value  # in USDT (≈USD)
+            "usd_value": bnb_usdt_value
         },
         "usdt": {
             "wei": str(usdt_wei),
@@ -258,9 +260,9 @@ async def check_balance(request: Request):
             "contract": usdt_checksum
         },
         "price": {
-            "bnb_usdt": bnb_price
+            "bnb_usdt": float(bnb_price) if bnb_price is not None else None
         }
-    })
+    }))
 
 # ------------------------------------------------------------
 #  Send USDT Endpoint (enhanced)
@@ -364,7 +366,7 @@ async def send_usdt(request: Request):
         try:
             after_usdt = usdt.functions.balanceOf(sender_checksum).call()
             after_bnb = w3.eth.get_balance(sender_checksum)
-        except Exception as e:
+        except Exception:
             # Fallback: compute expected values if fetch fails
             after_usdt = before_usdt - amount_wei
             after_bnb = before_bnb - (receipt.gasUsed * gas_price)
@@ -372,14 +374,14 @@ async def send_usdt(request: Request):
         # Gas details
         gas_used = receipt.gasUsed
         gas_cost_wei = gas_used * gas_price
-        gas_cost_bnb = w3.from_wei(gas_cost_wei, 'ether')
+        gas_cost_bnb = w3.from_wei(gas_cost_wei, 'ether')  # Decimal
         gas_cost_bnb_str = format_decimal(gas_cost_bnb, 18)
 
-        # Get BNB price with fallback
+        # Get BNB price (Decimal)
         bnb_price = await get_bnb_usdt_price(w3)
         gas_cost_usdt = None
         if bnb_price is not None:
-            gas_cost_usdt = format_decimal(gas_cost_bnb * bnb_price, 6)
+            gas_cost_usdt = format_decimal(gas_cost_bnb * Decimal(str(bnb_price)), 6)
 
         # Format balances
         before_usdt_formatted = format_decimal(before_usdt / (10 ** decimals), decimals)
@@ -415,11 +417,8 @@ async def send_usdt(request: Request):
             "sender": sender_checksum
         }
 
-        # Include price info if available
         if bnb_price is not None:
-            response_data["price"] = {
-                "bnb_usdt": bnb_price
-            }
+            response_data["price"] = {"bnb_usdt": float(bnb_price)}
 
         return JSONResponse(content=to_serializable(response_data))
 
